@@ -24,6 +24,9 @@ on:
   # Sans ce controle, l'ecart s'installe et le code cesse de decrire la realite.
   schedule:
     - cron: '0 6 * * *'
+  # Relance manuelle : sans ca, verifier un changement de pipeline oblige a
+  # pousser un commit qui touche infra/ juste pour declencher le workflow.
+  workflow_dispatch:
 
 permissions:
   contents: read
