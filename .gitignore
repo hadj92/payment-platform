@@ -1,0 +1,33 @@
+# Java / Maven
+target/
+*.class
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+# Les tfvars contiennent des valeurs propres a un compte (ARN, identifiants) : jamais
+# commites. Seul le .example l'est.
+*.tfvars
+!*.tfvars.example
+crash.log
+tfplan
+
+# Secrets : filet de securite. La vraie protection est un hook gitleaks en pre-commit.
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store

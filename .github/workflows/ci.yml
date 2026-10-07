@@ -1,0 +1,209 @@
+# =============================================================================
+# Pipeline applicatif : build, tests, analyse de securite, image, deploiement
+#
+# Principe directeur : chaque etape peut bloquer la livraison. Un pipeline qui
+# n'echoue jamais ne verifie rien. Et sur un composant du CDE, le pipeline EST une
+# piece de la conformite -- revue de code, analyse statique, scan de dependances et
+# tracabilite des deploiements sont des exigences PCI DSS (req. 6), pas des bonnes
+# intentions.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Annule les executions obsoletes sur une meme branche : economise des minutes de
+# runner et donne le retour sur le dernier commit plutot que sur un intermediaire.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: eu-west-3
+  ECR_REPOSITORY: payment-api
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build et tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Tests
+        working-directory: payment-api
+        run: mvn -B verify
+
+      # Le rapport de test est publie meme en cas d'echec : sans ca, il faut relire des
+      # logs brut pour savoir ce qui a casse.
+      - name: Publier les resultats de test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: payment-api/target/surefire-reports/
+
+      # Analyse des dependances : la majorite des vulnerabilites d'une application Java
+      # viennent de ses dependances transitives, pas de son propre code.
+      - name: Scan des dependances
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: payment-api
+          severity: 'CRITICAL,HIGH'
+          # On echoue le build sur une vulnerabilite critique. C'est volontairement
+          # contraignant : laisser passer en "warning" revient a ne pas scanner.
+          exit-code: '1'
+          ignore-unfixed: true
+
+  # Analyse statique du code : SAST. Cherche les defauts que les tests ne voient pas
+  # (injection, secret en dur, crypto faible).
+  static-analysis:
+    name: Analyse statique
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialiser CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Compiler pour l'analyse
+        working-directory: payment-api
+        run: mvn -B compile -DskipTests
+
+      - name: Analyser
+        uses: github/codeql-action/analyze@v3
+
+  # Recherche de secrets dans l'historique. Un token de PSP commite puis supprime reste
+  # dans l'historique Git : il faut le detecter au plus tot, et le revoquer.
+  secret-scan:
+    name: Recherche de secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # historique complet : un secret supprime reste dans les commits
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-image:
+    name: Construire et publier l'image
+    needs: [build-and-test, static-analysis, secret-scan]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # requis par l'authentification OIDC vers AWS
+      contents: read
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # OIDC : aucune cle AWS longue duree dans GitHub.
+      #
+      # GitHub presente un jeton signe, le role IAM a une trust policy qui restreint le
+      # 'sub' a ce depot ET a cette branche. Rien a faire tourner, rien a fuiter. C'est
+      # la reponse directe a l'exigence PCI req. 8 sur les credentials statiques -- et
+      # la premiere chose a citer quand on parle de CI/CD securisee.
+      - name: Authentification AWS par OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connexion a ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configurer buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construire et pousser
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: payment-api
+          push: true
+          # ARM64 pour tourner sur Graviton : meilleur rapport performance/prix.
+          platforms: linux/arm64
+          # Tag immuable base sur le SHA du commit, jamais 'latest'. Un deploiement doit
+          # etre reproductible et un rollback doit pointer vers une image precise.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scanner l'image publiee
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          severity: 'CRITICAL'
+          exit-code: '1'
+          ignore-unfixed: true
+
+  deploy:
+    name: Deployer en production
+    needs: build-image
+    runs-on: ubuntu-latest
+    # GitHub Environments impose une approbation manuelle et conserve la trace de qui
+    # a approuve quel deploiement. C'est la piste d'audit que demandera un QSA.
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role de deploiement distinct du role de build : separation des privileges.
+          # Celui qui construit l'image n'a pas le droit de deployer.
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Le deploiement est un apply Terraform avec la nouvelle image : l'etat de la
+      # production reste entierement decrit par le code. Un 'aws ecs update-service'
+      # a la main creerait un ecart invisible dans le state.
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Deployer
+        working-directory: infra/envs/prod
+        run: |
+          terraform init
+          terraform apply -auto-approve \
+            -var="payment_api_image=${{ needs.build-image.outputs.image }}"
+
+      # Le deploiement n'est pas fini quand l'apply rend la main : il est fini quand
+      # ECS a stabilise le service avec les nouvelles taches en bonne sante. Le circuit
+      # breaker ECS fait le rollback automatiquement si ce n'est pas le cas.
+      - name: Attendre la stabilisation du service
+        run: |
+          aws ecs wait services-stable \
+            --cluster payment-platform-prod-cluster \
+            --services payment-api

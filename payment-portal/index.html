@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Portail paiements</title>
+
+    <!--
+      Content Security Policy.
+
+      Sur une page de paiement, ce n'est pas une precaution generique : PCI DSS v4
+      l'exige explicitement (req. 6.4.3 et 11.6.1) depuis les attaques de type
+      Magecart, ou un script tiers compromis exfiltre les numeros de carte saisis dans
+      le formulaire -- sans jamais toucher au serveur du marchand.
+
+      Les directives qui comptent ici :
+        script-src 'self' + le domaine du PSP  -> aucun autre script ne s'execute
+        frame-src  le PSP                      -> l'iframe du formulaire de carte
+        connect-src 'self' + le PSP            -> aucune exfiltration vers un tiers
+        form-action 'self'                     -> un formulaire ne peut pas poster ailleurs
+        object-src 'none'                      -> supprime une classe entiere d'attaques
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self' https://checkout.psp.example;
+        style-src 'self' 'unsafe-inline';
+        frame-src https://checkout.psp.example;
+        connect-src 'self' https://api.psp.example;
+        img-src 'self' data:;
+        object-src 'none';
+        base-uri 'self';
+        form-action 'self';
+        frame-ancestors 'none'
+      "
+    />
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

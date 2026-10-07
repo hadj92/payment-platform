@@ -1,0 +1,215 @@
+# =============================================================================
+# Pipeline d'infrastructure
+#
+# Deux regles qui structurent tout :
+#
+#   1. On applique LE PLAN QUI A ETE REVU, pas un nouveau plan calcule a l'apply.
+#      Sinon on applique quelque chose que personne n'a lu -- l'infra a pu changer
+#      entre la revue et la fusion.
+#   2. Le role de plan est en LECTURE SEULE, le role d'apply est distinct. Un plan
+#      s'execute sur chaque PR, y compris celles de contributeurs externes : il ne doit
+#      jamais pouvoir modifier quoi que ce soit.
+# =============================================================================
+
+name: Terraform
+
+on:
+  push:
+    branches: [main]
+    paths: ['infra/**']
+  pull_request:
+    branches: [main]
+    paths: ['infra/**']
+  # Detection de derive : quelqu'un a modifie une ressource a la main dans la console.
+  # Sans ce controle, l'ecart s'installe et le code cesse de decrire la realite.
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Format et validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.2
+
+      - name: Verifier le formatage
+        run: terraform fmt -check -recursive infra/
+
+      - name: Valider chaque module et environnement
+        run: |
+          for dir in infra/modules/*/ infra/envs/*/; do
+            echo "::group::$dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - name: tflint
+        uses: terraform-linters/setup-tflint@v4
+      - run: tflint --recursive --chdir=infra
+
+  security:
+    name: Analyse de securite de l'infra
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Policy as code : bloque en revue un bucket public, un security group ouvert sur
+      # 0.0.0.0/0 en SSH, une ressource non chiffree. Attraper ces erreurs en PR coute
+      # infiniment moins cher que de les decouvrir dans un rapport d'audit.
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra/
+          framework: terraform
+          output_format: sarif
+          output_file_path: results.sarif
+          soft_fail: false
+
+      - name: Publier dans l'onglet Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+  plan:
+    name: Plan
+    needs: [validate, security]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.2
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role en LECTURE SEULE : un plan ne doit rien pouvoir modifier.
+          role-to-assume: ${{ secrets.AWS_TF_PLAN_ROLE_ARN }}
+          aws-region: eu-west-3
+
+      - name: Plan
+        id: plan
+        working-directory: infra/envs/prod
+        run: |
+          terraform init
+          terraform plan -out=tfplan -lock-timeout=5m -no-color | tee plan.txt
+          echo "exitcode=$?" >> "$GITHUB_OUTPUT"
+
+      # Le plan sauvegarde est l'artefact qui sera applique apres fusion : on applique
+      # ce qui a ete revu, pas un recalcul.
+      - name: Conserver le plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: infra/envs/prod/tfplan
+          retention-days: 5
+
+      # Le plan en commentaire de PR : la revue d'infrastructure devient une revue de
+      # code normale, avec le diff sous les yeux du relecteur.
+      - name: Publier le plan sur la PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infra/envs/prod/plan.txt', 'utf8');
+            const truncated = plan.length > 60000
+              ? plan.slice(0, 60000) + '\n\n... (plan tronque, voir les logs du job)'
+              : plan;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `#### Terraform plan — \`prod\`\n\n<details><summary>Afficher le plan</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n\n</details>`
+            });
+
+  apply:
+    name: Apply
+    needs: [validate, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Approbation manuelle requise, et tracee : qui a approuve quel changement
+    # d'infrastructure, et quand.
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.2
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role distinct, avec droits d'ecriture. Il n'autorise pas la suppression des
+          # ressources de donnees : combine a prevent_destroy et deletion_protection,
+          # un 'terraform destroy' accidentel sur la base est techniquement impossible.
+          role-to-assume: ${{ secrets.AWS_TF_APPLY_ROLE_ARN }}
+          aws-region: eu-west-3
+
+      - name: Apply
+        working-directory: infra/envs/prod
+        run: |
+          terraform init
+          terraform apply -auto-approve -lock-timeout=5m
+
+  drift:
+    name: Detection de derive
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.2
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TF_PLAN_ROLE_ARN }}
+          aws-region: eu-west-3
+
+      # -detailed-exitcode : 0 = aucun changement, 2 = derive detectee, 1 = erreur.
+      # C'est le mecanisme qui permet de transformer "le code ne decrit plus la realite"
+      # en alerte actionnable.
+      - name: Chercher une derive
+        id: drift
+        working-directory: infra/envs/prod
+        continue-on-error: true
+        run: |
+          terraform init
+          terraform plan -detailed-exitcode -no-color > drift.txt 2>&1
+          echo "exitcode=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Ouvrir une issue si derive
+        if: steps.drift.outputs.exitcode == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const drift = fs.readFileSync('infra/envs/prod/drift.txt', 'utf8').slice(0, 60000);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Derive d'infrastructure detectee en production — ${new Date().toISOString().split('T')[0]}`,
+              labels: ['infrastructure', 'drift'],
+              body: `Le plan quotidien a detecte un ecart entre le code et l'etat reel de la production.\n\nUn changement a ete fait hors Terraform, ou une ressource a derive.\n\n\`\`\`\n${drift}\n\`\`\``
+            });

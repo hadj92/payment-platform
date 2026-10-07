@@ -1,0 +1,44 @@
+# Profil de test : H2 en memoire, schema genere par Hibernate.
+#
+# Pourquoi ne pas rejouer les migrations Flyway ici : V1 utilise des index partiels
+# PostgreSQL (CREATE INDEX ... WHERE), que H2 ne sait pas interpreter. Ces index sont
+# un vrai choix de conception -- ils gardent l'index de l'outbox petit meme avec des
+# millions d'evenements publies -- et on ne va pas degrader le schema de production
+# pour arranger la base de test.
+#
+# La consequence est assumee et compensee : les tests ici valident la logique
+# applicative (idempotence, machine a etats, invariants monetaires), et la validite des
+# migrations se verifie en CI sur un vrai PostgreSQL via Testcontainers. Tester les
+# migrations sur un moteur different de la production donne une fausse assurance.
+spring:
+  datasource:
+    url: jdbc:h2:mem:payments;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+  flyway:
+    enabled: false
+
+# Pas de latence simulee : les tests doivent etre rapides et deterministes.
+psp:
+  simulated:
+    latency-ms: 0
+
+# Les jobs planifies sont neutralises : un test ne doit jamais dependre d'un
+# declenchement temporel qu'il ne controle pas. Les methodes sont appelees
+# explicitement dans les tests qui les concernent.
+outbox:
+  poll-interval-ms: 3600000
+idempotency:
+  purge-interval-ms: 3600000
+
+logging:
+  level:
+    com.hospitality.payment: WARN
+    org.hibernate: WARN

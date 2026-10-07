@@ -1,0 +1,6 @@
+# Copier en terraform.tfvars et renseigner.
+# terraform.tfvars n'est PAS commite (voir .gitignore) : il contient des valeurs
+# propres a un compte.
+
+certificate_arn   = "arn:aws:acm:eu-west-3:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+payment_api_image = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/payment-api:1.0.0"

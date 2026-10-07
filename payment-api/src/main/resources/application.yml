@@ -1,0 +1,144 @@
+spring:
+  application:
+    name: payment-api
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/payments}
+    username: ${DB_USERNAME:payments}
+    # En production ce mot de passe n'existe pas : la tache ECS obtient un jeton IAM
+    # de 15 minutes aupres d'Aurora (IAM database authentication). A defaut, la valeur
+    # est injectee depuis Secrets Manager par l'execution role ECS -- jamais en clair
+    # dans une task definition, jamais commitee.
+    password: ${DB_PASSWORD:payments}
+    hikari:
+      # Dimensionnement du pool : volontairement petit. Un pool surdimensionne ne rend
+      # pas la base plus rapide, il deplace juste la file d'attente du service vers la
+      # base, ou elle coute plus cher. Regle de depart : coeurs x 2 + disques.
+      maximum-pool-size: ${DB_POOL_MAX:15}
+      minimum-idle: 5
+      connection-timeout: 3000
+      # Ferme les connexions avant le timeout cote base pour eviter les erreurs
+      # "connection closed" au premier appel apres une periode creuse.
+      max-lifetime: 900000
+
+  jpa:
+    # Jamais de generation de schema automatique sur une base qui porte de l'argent :
+    # c'est Flyway qui fait foi, avec des migrations versionnees et revues en PR.
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false   # evite de tenir une session ouverte pendant le rendu HTTP
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 25
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+  # Les threads virtuels conviendraient bien a ce profil -- le service passe
+  # l'essentiel de son temps a attendre le PSP et la base -- mais ils exigent Java 21.
+  # Sur Java 17, activer cette option fait echouer le demarrage.
+  #   threads:
+  #     virtual:
+  #       enabled: true
+
+  lifecycle:
+    # Laisse les requetes en vol se terminer avant de rendre la tache : on ne coupe pas
+    # une autorisation au milieu pendant un deploiement.
+    timeout-per-shutdown-phase: 25s
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful       # on ne coupe pas une autorisation en cours pendant un deploiement
+  error:
+    include-stacktrace: never   # une stack trace ne sort jamais vers un client
+  tomcat:
+    max-threads: 200
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Exposition minimale. En production ces endpoints ecoutent sur un port separe,
+        # accessible seulement depuis le VPC : un health check ne doit pas etre public.
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true     # /readiness et /liveness pour les health checks ALB / ECS
+      show-details: when-authorized
+  metrics:
+    tags:
+      application: payment-api
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      psp:
+        # Fenetre glissante sur le nombre d'appels : previsible et facile a expliquer.
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10      # on n'ouvre pas le circuit sur 2 echecs isoles
+        failure-rate-threshold: 50       # 50 % d'echecs -> ouverture
+        wait-duration-in-open-state: 10s # on laisse le PSP respirer
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+        # Un refus de l'emetteur n'est PAS une panne : il ne doit jamais ouvrir le circuit.
+        record-exceptions:
+          - com.hospitality.payment.adapter.out.psp.SimulatedPspAdapter$PspTechnicalException
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+  retry:
+    instances:
+      psp:
+        max-attempts: 3
+        wait-duration: 200ms
+        # Backoff exponentiel + jitter : sans jitter, tous les clients retentent en
+        # choeur et achevent le service qui se remet a peine debout.
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        enable-randomized-wait: true
+        randomized-wait-factor: 0.5
+        retry-exceptions:
+          - com.hospitality.payment.adapter.out.psp.SimulatedPspAdapter$PspTechnicalException
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+  timelimiter:
+    instances:
+      psp:
+        # Un timeout court est une protection : au-dela, le client a de toute facon
+        # abandonne, et la requete ne fait plus que consommer un thread.
+        timeout-duration: 3s
+
+payment:
+  authorization:
+    # Duree de validite du hold. Les MCC hoteliers (7011) beneficient de fenetres
+    # allongees chez les schemes, mais au-dela il faut re-autoriser pour encaisser.
+    hold-validity-days: ${HOLD_VALIDITY_DAYS:7}
+
+psp:
+  simulated:
+    latency-ms: ${PSP_LATENCY_MS:40}
+
+outbox:
+  poll-interval-ms: 1000
+  batch-size: 50
+  max-attempts: 5
+
+idempotency:
+  purge-interval-ms: 3600000
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    com.hospitality.payment: INFO
+  pattern:
+    # traceId/spanId dans chaque ligne : sans correlation, debugger un paiement qui
+    # traverse trois services releve de l'archeologie.
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{traceId:-}/%X{spanId:-}] %logger{36} - %msg%n"
