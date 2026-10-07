@@ -84,7 +84,8 @@ jobs:
   plan:
     name: Plan
     needs: [validate, security]
-    if: github.event_name == 'pull_request'
+    # Le plan interroge l'etat reel : il lui faut un compte AWS.
+    if: github.event_name == 'pull_request' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -140,7 +141,7 @@ jobs:
   apply:
     name: Apply
     needs: [validate, security]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     # Approbation manuelle requise, et tracee : qui a approuve quel changement
     # d'infrastructure, et quand.
@@ -170,7 +171,7 @@ jobs:
 
   drift:
     name: Detection de derive
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write

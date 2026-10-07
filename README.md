@@ -204,6 +204,8 @@ cd infra/envs/prod && terraform init -backend=false && terraform validate
 - Scans : CodeQL (SAST), Trivy (dépendances + image), gitleaks (secrets dans l'historique), Checkov (policy as code sur le Terraform).
 - **Image taguée par SHA, jamais `latest`** — un déploiement doit être reproductible et un rollback doit viser une image précise.
 
+> **Les étapes de déploiement sont écrites mais désactivées.** Build d'image, `terraform plan`/`apply` et détection de dérive ne s'exécutent que si le dépôt est relié à un compte AWS — variable de dépôt `DEPLOY_ENABLED=true` et secrets de rôle OIDC. Sans cible configurée, ces jobs échoueraient systématiquement, et un badge rouge permanent finit par ne plus rien signaler. Le code du pipeline reste complet et lisible : c'est lui qui documente la chaîne de livraison.
+
 ---
 
 ## Ce qu'il resterait à faire pour une vraie production

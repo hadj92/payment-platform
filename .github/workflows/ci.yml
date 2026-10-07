@@ -117,7 +117,9 @@ jobs:
   build-image:
     name: Construire et publier l'image
     needs: [build-and-test, static-analysis, secret-scan]
-    if: github.ref == 'refs/heads/main'
+    # Ne s'execute que si le depot est relie a un compte AWS :
+    # variable de depot DEPLOY_ENABLED = true, plus les secrets de role.
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # requis par l'authentification OIDC vers AWS
@@ -172,6 +174,7 @@ jobs:
   deploy:
     name: Deployer en production
     needs: build-image
+    if: vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     # GitHub Environments impose une approbation manuelle et conserve la trace de qui
     # a approuve quel deploiement. C'est la piste d'audit que demandera un QSA.
