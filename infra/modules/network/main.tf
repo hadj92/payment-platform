@@ -259,3 +259,23 @@ resource "aws_flow_log" "this" {
     Name = "${local.name_prefix}-flow-logs"
   }
 }
+
+# --------------------------------------------------------------------- durcissement
+
+# Le security group « default » d'un VPC autorise par construction tout le trafic
+# entre ses membres. On ne peut pas le supprimer, mais on peut le vider : déclaré
+# ici sans aucune règle, il devient un groupe qui ne laisse rien passer.
+#
+# Pourquoi ça compte : toute ressource créée sans security group explicite atterrit
+# dans celui-ci. Le laisser ouvert, c'est garantir qu'une ressource oubliée un jour
+# sera jointe librement depuis tout le VPC — exactement ce que la segmentation PCI
+# cherche à empêcher.
+resource "aws_default_security_group" "this" {
+  vpc_id = aws_vpc.this.id
+
+  # Aucun bloc ingress ni egress : le groupe existe et ne laisse rien passer.
+
+  tags = {
+    Name = "${local.name_prefix}-default-verrouille"
+  }
+}

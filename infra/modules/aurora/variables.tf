@@ -68,9 +68,3 @@ variable "reader_count" {
   type        = number
   default     = 1
 }
-
-variable "monitoring_role_arn" {
-  description = "Role IAM pour Enhanced Monitoring. Null pour desactiver."
-  type        = string
-  default     = null
-}

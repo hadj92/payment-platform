@@ -1,0 +1,17 @@
+# Vulnerabilites ecartees apres analyse d'exploitabilite.
+#
+# Regle : on n'ecarte une CVE que si on peut dire POURQUOI elle ne s'applique pas
+# ici, et on redate l'analyse a chaque revue. Une liste d'exclusions sans
+# justification revient a desactiver le scanner en faisant semblant de l'utiliser.
+
+# CVE-2026-47884 — spring-webmvc : execution de code a distance via une limitation
+# de chemin insuffisante dans XsltView.
+#
+# Non exploitable ici : l'application n'utilise aucune vue XSLT. Elle n'expose que
+# du JSON via @RestController, ne declare aucun ViewResolver, et n'embarque pas
+# spring-webmvc-xslt. Le correctif n'existe que dans Spring Framework 7.0.9, donc
+# Spring Boot 4.x, dont la migration est planifiee separement (le starter AOP et
+# les modules de test y ont ete reorganises).
+#
+# A revoir : lors du passage a Spring Boot 4.
+CVE-2026-47884

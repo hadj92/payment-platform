@@ -183,6 +183,14 @@ resource "aws_security_group" "service" {
 }
 
 resource "aws_lb_target_group" "this" {
+  # CKV_AWS_378 — le trafic entre l'ALB et les tâches est en HTTP. PCI DSS v4 pousse
+  # vers un chiffrement de bout en bout, et c'est la bonne cible : il faudrait
+  # distribuer un certificat à chaque tâche et terminer le TLS dans le conteneur.
+  # Tant que ce n'est pas fait, le trafic reste confiné à des subnets privés sans
+  # route vers Internet, entre deux security groups qui se référencent mutuellement.
+  # Limite connue et assumée, pas un oubli.
+  #checkov:skip=CKV_AWS_378: TLS ALB->tache a implementer ; trafic confine en subnets prives
+
   name_prefix = substr(var.service_name, 0, 6)
   port        = var.container_port
   protocol    = "HTTP"

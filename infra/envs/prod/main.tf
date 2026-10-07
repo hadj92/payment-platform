@@ -32,6 +32,153 @@ module "network" {
   enable_flow_logs   = false # a activer avec un bucket de destination
 }
 
+# --------------------------------------------------------------------- journaux
+
+# Bucket des journaux d'accès (ALB, et plus tard CloudFront).
+#
+# PCI DSS req. 10 impose de journaliser les accès et de conserver 12 mois. Les logs
+# d'accès de l'ALB sont aussi la première pièce de preuve d'une investigation : sans
+# eux, on ne peut pas répondre à « qui a appelé cette route, et depuis où ».
+resource "aws_s3_bucket" "logs" {
+  # CKV_AWS_145 — le chiffrement est en SSE-S3 et non SSE-KMS. Ce n'est pas un choix :
+  # le service de journalisation de l'ALB refuse d'écrire dans un bucket chiffré par
+  # une CMK. Le contenu reste chiffré au repos et le transport non chiffré est refusé
+  # par la politique du bucket.
+  #checkov:skip=CKV_AWS_145: le service de logs ALB n'ecrit pas dans un bucket SSE-KMS
+
+  # CKV_AWS_18 — activer les logs d'accès sur le bucket qui reçoit les logs d'accès
+  # revient à se mordre la queue : chaque écriture en génère une autre. Les accès à ce
+  # bucket sont tracés par CloudTrail (données S3), qui est le bon outil pour ça.
+  #checkov:skip=CKV_AWS_18: bucket de destination des logs ; acces traces par CloudTrail
+
+  # CKV_AWS_144 — pas de réplication inter-région. Les journaux sont déjà durables
+  # (11 neufs) et versionnés ; une copie dans une seconde région doublerait le coût de
+  # stockage pour un scénario — la perte complète d'une région AWS — qui n'est pas dans
+  # les objectifs de reprise retenus ici.
+  #checkov:skip=CKV_AWS_144: durabilite S3 + versioning suffisants pour ce RPO
+
+  # CKV2_AWS_62 — les notifications d'événements servent à déclencher un traitement à
+  # chaque dépôt. Rien ne consomme ces journaux en temps réel : ils sont lus lors
+  # d'une investigation, et archivés sinon.
+  #checkov:skip=CKV2_AWS_62: aucun consommateur temps reel de ces journaux
+
+  bucket_prefix = "${local.name_prefix}-logs-"
+
+  # Les journaux d'audit ne se suppriment pas sur un coup de plan mal relu.
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  tags = {
+    Name      = "${local.name_prefix}-logs"
+    DataClass = "audit"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      # SSE-S3 et non SSE-KMS : le service de journalisation de l'ALB n'écrit pas
+      # dans un bucket chiffré par une CMK. C'est une limite d'AWS, pas un choix.
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    id     = "retention-pci"
+    status = "Enabled"
+
+    filter {}
+
+    # Un envoi multipart interrompu laisse des fragments facturés que rien ne
+    # référence et que personne ne voit. On les purge.
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+
+    # 3 mois immédiatement accessibles, puis archivage — exactement ce que
+    # demande PCI DSS req. 10 : 12 mois de rétention dont 3 disponibles.
+    transition {
+      days          = 90
+      storage_class = "GLACIER"
+    }
+
+    expiration {
+      days = 400
+    }
+  }
+}
+
+# Le service de journalisation de l'ALB écrit avec une identité régionale dédiée.
+data "aws_elb_service_account" "main" {}
+
+data "aws_iam_policy_document" "logs" {
+  statement {
+    sid    = "EcritureDesLogsAlb"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = [data.aws_elb_service_account.main.arn]
+    }
+
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.logs.arn}/alb/*"]
+  }
+
+  # Refuse toute écriture non chiffrée : une politique de bucket vaut mieux qu'une
+  # consigne, parce qu'elle s'applique même à ce qu'on a oublié de configurer.
+  statement {
+    sid    = "RefuseTransportNonChiffre"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = ["s3:*"]
+    resources = [
+      aws_s3_bucket.logs.arn,
+      "${aws_s3_bucket.logs.arn}/*",
+    ]
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  policy = data.aws_iam_policy_document.logs.json
+}
+
 # --------------------------------------------------------------------- ALB
 
 resource "aws_security_group" "alb" {
@@ -69,6 +216,20 @@ resource "aws_security_group" "alb" {
 }
 
 resource "aws_lb" "this" {
+  # CKV_AWS_378 — le contrôle vise le protocole entre l'ALB et ses cibles, qui est
+  # ici en HTTP à l'intérieur du VPC. PCI DSS v4 pousse vers un chiffrement de bout
+  # en bout, et c'est la bonne cible : il faudrait distribuer un certificat à chaque
+  # tâche et terminer le TLS dans le conteneur. Tant que ce n'est pas fait, le
+  # trafic reste confiné à des subnets privés sans route vers Internet, entre deux
+  # security groups qui se référencent. C'est une limite connue, pas un oubli.
+  #checkov:skip=CKV_AWS_378: TLS ALB->tache a implementer ; trafic confine en subnets prives
+
+  # CKV2_AWS_76 — le contrôle cherche une protection Log4j (CVE-2021-44228). Elle est
+  # présente : la règle « aws-managed-bad-inputs » active
+  # AWSManagedRulesKnownBadInputsRuleSet, dont fait partie Log4JRCE, et l'ACL est
+  # associée à cet ALB plus bas. L'analyse de graphe ne relie pas toujours les deux.
+  #checkov:skip=CKV2_AWS_76: KnownBadInputsRuleSet (contient Log4JRCE) actif et associe a cet ALB
+
   name               = "${local.name_prefix}-alb"
   load_balancer_type = "application"
   internal           = false
@@ -82,13 +243,17 @@ resource "aws_lb" "this" {
   # le request smuggling, qui permet de contourner des controles en amont.
   drop_invalid_header_fields = true
 
-  # Les logs d'acces de l'ALB sont une exigence d'audit (req. 10) et le premier
-  # element de preuve en cas d'investigation.
-  # access_logs {
-  #   bucket  = var.access_logs_bucket
-  #   prefix  = local.name_prefix
-  #   enabled = true
-  # }
+  # Mode de défense contre le request smuggling : on rejette ce qui est ambigu
+  # plutôt que de le normaliser au risque de contourner un contrôle en amont.
+  desync_mitigation_mode = "strictest"
+
+  access_logs {
+    bucket  = aws_s3_bucket.logs.id
+    prefix  = "alb"
+    enabled = true
+  }
+
+  depends_on = [aws_s3_bucket_policy.logs]
 
   tags = {
     Name = "${local.name_prefix}-alb"
@@ -212,6 +377,137 @@ resource "aws_wafv2_web_acl" "this" {
   tags = {
     Name = "${local.name_prefix}-waf"
   }
+}
+
+# Journalisation du WAF.
+#
+# Sans elle, on sait qu'une requête a été bloquée mais jamais laquelle ni pourquoi.
+# C'est ce qui permet, après une vague de card testing, de reconstituer l'attaque et
+# d'ajuster les règles — et c'est une exigence de traçabilité (req. 10).
+#
+# Le nom du groupe de logs DOIT commencer par « aws-waf-logs- » : c'est une
+# contrainte du service, pas une convention.
+# CMK des journaux.
+#
+# Les logs du WAF contiennent les URL, les en-têtes et les paramètres des requêtes
+# bloquées : de quoi reconstituer le trafic d'une plateforme de paiement. Ils méritent
+# une clé gérée par nous, dont chaque usage est tracé.
+resource "aws_kms_key" "logs" {
+  description             = "Chiffrement des journaux de la plateforme de paiement"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  policy                  = data.aws_iam_policy_document.logs_key.json
+
+  tags = {
+    Name = "${local.name_prefix}-logs-key"
+  }
+}
+
+resource "aws_kms_alias" "logs" {
+  name          = "alias/${local.name_prefix}-logs"
+  target_key_id = aws_kms_key.logs.key_id
+}
+
+data "aws_iam_policy_document" "logs_key" {
+  # Dans une POLITIQUE DE CLÉ, `resources = ["*"]` ne signifie pas « toutes les
+  # ressources » : il désigne la clé à laquelle la politique est attachée, et c'est la
+  # seule écriture possible. Les contrôles ci-dessous visent les politiques IAM
+  # ordinaires, où un `*` serait effectivement trop large.
+  #checkov:skip=CKV_AWS_109: politique de cle KMS, "*" designe la cle elle-meme
+  #checkov:skip=CKV_AWS_111: politique de cle KMS, "*" designe la cle elle-meme
+  #checkov:skip=CKV_AWS_356: politique de cle KMS, "*" designe la cle elle-meme
+
+  # Sans cette instruction la clé devient inadministrable, donc irrécupérable.
+  statement {
+    sid    = "AdministrationDeLaCle"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  # CloudWatch Logs chiffre et déchiffre, sans jamais administrer la clé.
+  statement {
+    sid    = "UtilisationParCloudWatchLogs"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${var.region}.amazonaws.com"]
+    }
+
+    actions = [
+      "kms:Encrypt*",
+      "kms:Decrypt*",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:Describe*",
+    ]
+    resources = ["*"]
+
+    condition {
+      test     = "ArnLike"
+      variable = "kms:EncryptionContext:aws:logs:arn"
+      values   = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:*"]
+    }
+  }
+}
+
+resource "aws_cloudwatch_log_group" "waf" {
+  name              = "aws-waf-logs-${local.name_prefix}"
+  retention_in_days = 365
+  kms_key_id        = aws_kms_key.logs.arn
+}
+
+resource "aws_cloudwatch_log_resource_policy" "waf" {
+  policy_name     = "${local.name_prefix}-waf-logs"
+  policy_document = data.aws_iam_policy_document.waf_logs.json
+}
+
+data "aws_iam_policy_document" "waf_logs" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["delivery.logs.amazonaws.com"]
+    }
+
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.waf.arn}:*"]
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:*"]
+    }
+  }
+}
+
+resource "aws_wafv2_web_acl_logging_configuration" "this" {
+  resource_arn            = aws_wafv2_web_acl.this.arn
+  log_destination_configs = [aws_cloudwatch_log_group.waf.arn]
+
+  # Les en-têtes qui portent des secrets ne doivent pas atterrir dans les logs du
+  # WAF : un journal de sécurité qui contient des jetons devient lui-même un risque.
+  redacted_fields {
+    single_header {
+      name = "authorization"
+    }
+  }
+
+  redacted_fields {
+    single_header {
+      name = "cookie"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_resource_policy.waf]
 }
 
 resource "aws_wafv2_web_acl_association" "alb" {

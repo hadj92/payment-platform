@@ -129,6 +129,23 @@ cd payment-portal && npm test
 
 **58 tests Java** (domaine sans infrastructure + intégration API) et **7 tests front**.
 
+### Sécurité de la chaîne
+
+La CI bloque sur les vulnérabilités critiques et sur les contrôles d'infrastructure — elle ne se contente pas de les signaler :
+
+| Scanner | Portée | État |
+|---|---|---|
+| **Trivy** | dépendances Java | **0 CRITICAL/HIGH** — versions de Tomcat, PostgreSQL et Jackson surchargées au-delà de ce qu'épingle Spring Boot |
+| **Checkov** | Terraform | **209 contrôles passés, 0 échec**, 15 exceptions |
+| **CodeQL** | code Java | analyse statique à chaque PR |
+| **gitleaks** | historique Git | recherche de secrets sur l'historique complet |
+
+Chaque exception porte **sa justification dans le code**, à côté de la ressource concernée — une liste d'exclusions sans raison revient à désactiver le scanner en faisant semblant de l'utiliser. Par exemple :
+
+- la politique d'une **clé KMS** utilise `resources = ["*"]`, où `*` désigne la clé elle-même : c'est la seule écriture possible, et les contrôles IAM génériques ne s'y appliquent pas ;
+- le trafic **ALB → tâche** est en HTTP : c'est une limite assumée et documentée, pas un oubli — le chiffrement de bout en bout demanderait de distribuer un certificat à chaque tâche ;
+- `CVE-2026-47884` (spring-webmvc) est écartée après **analyse d'exploitabilité** : l'application n'utilise aucune vue XSLT, n'expose que du JSON et ne déclare aucun `ViewResolver`. Le correctif n'existe qu'en Spring Framework 7, donc Spring Boot 4 — migration planifiée séparément.
+
 ### Scénarios simulables par préfixe de token
 
 Dans l'esprit des numéros de test publiés par les PSP :

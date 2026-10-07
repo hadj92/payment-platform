@@ -64,6 +64,8 @@ jobs:
           scan-type: fs
           scan-ref: payment-api
           severity: 'CRITICAL,HIGH'
+          # Exclusions justifiees une par une, avec leur analyse d'exploitabilite.
+          trivyignores: payment-api/.trivyignore
           # On echoue le build sur une vulnerabilite critique. C'est volontairement
           # contraignant : laisser passer en "warning" revient a ne pas scanner.
           exit-code: '1'

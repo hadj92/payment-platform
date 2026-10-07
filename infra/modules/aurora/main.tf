@@ -24,10 +24,74 @@ locals {
 # cle (qui l'administre n'est pas qui l'utilise -- la separation des roles de PCI DSS
 # req. 7), on peut la revoquer pour rendre les sauvegardes illisibles, et chaque
 # utilisation est tracee dans CloudTrail sous notre cle.
+data "aws_caller_identity" "current" {}
+
+# Politique de clé explicite.
+#
+# Sans politique, une CMK reçoit une politique par défaut qui délègue tout à l'IAM
+# du compte : n'importe quelle identité suffisamment large peut l'utiliser ET
+# l'administrer. PCI DSS req. 7 demande l'inverse — séparer qui administre la clé
+# de qui s'en sert. C'est exactement l'argument qu'on avance sur les CMK dédiées,
+# il serait incohérent de ne pas l'appliquer.
+data "aws_iam_policy_document" "database_key" {
+  # Dans une POLITIQUE DE CLÉ, `resources = ["*"]` ne signifie pas « toutes les
+  # ressources » : il désigne la clé à laquelle la politique est attachée, et c'est la
+  # seule écriture possible. Les contrôles ci-dessous visent les politiques IAM
+  # ordinaires, où un `*` serait effectivement trop large.
+  #checkov:skip=CKV_AWS_109: politique de cle KMS, "*" designe la cle elle-meme
+  #checkov:skip=CKV_AWS_111: politique de cle KMS, "*" designe la cle elle-meme
+  #checkov:skip=CKV_AWS_356: politique de cle KMS, "*" designe la cle elle-meme
+
+  # Administration de la clé : le compte, via ses administrateurs. Cette instruction
+  # est obligatoire — sans elle, la clé devient inadministrable et irrécupérable.
+  statement {
+    sid    = "AdministrationDeLaCle"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  # Utilisation par RDS : chiffrer et déchiffrer, jamais administrer la clé.
+  statement {
+    sid    = "UtilisationParRds"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["rds.amazonaws.com"]
+    }
+
+    actions = [
+      "kms:Decrypt",
+      "kms:Encrypt",
+      "kms:GenerateDataKey*",
+      "kms:ReEncrypt*",
+      "kms:DescribeKey",
+      "kms:CreateGrant",
+    ]
+    resources = ["*"]
+
+    # Limite l'usage au compte courant : la clé ne peut pas être utilisée
+    # par un service agissant pour le compte d'un tiers.
+    condition {
+      test     = "StringEquals"
+      variable = "kms:CallerAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
 resource "aws_kms_key" "database" {
   description             = "Chiffrement au repos du cluster de paiements ${var.environment}"
   enable_key_rotation     = true
   deletion_window_in_days = var.environment == "prod" ? 30 : 7
+  policy                  = data.aws_iam_policy_document.database_key.json
 
   tags = {
     Name      = "${local.name_prefix}-db-key"
@@ -38,6 +102,40 @@ resource "aws_kms_key" "database" {
 resource "aws_kms_alias" "database" {
   name          = "alias/${local.name_prefix}-database"
   target_key_id = aws_kms_key.database.key_id
+}
+
+# --------------------------------------------------------------------- monitoring
+
+# Rôle de l'Enhanced Monitoring.
+#
+# Correction d'une incohérence : le cluster déclarait un `monitoring_interval` sans
+# fournir de rôle, donc l'enhanced monitoring ne démarrait jamais. Un paramètre de
+# surveillance qui ne surveille rien est pire qu'absent — on croit avoir la métrique.
+data "aws_iam_policy_document" "monitoring_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["monitoring.rds.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "monitoring" {
+  name_prefix        = substr("${local.name_prefix}-rds-mon-", 0, 32)
+  assume_role_policy = data.aws_iam_policy_document.monitoring_assume.json
+  description        = "Enhanced Monitoring du cluster de paiements"
+
+  tags = {
+    Name = "${local.name_prefix}-rds-monitoring"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "monitoring" {
+  role       = aws_iam_role.monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
 }
 
 # --------------------------------------------------------------------- reseau
@@ -127,6 +225,27 @@ resource "aws_rds_cluster_parameter_group" "this" {
 # --------------------------------------------------------------------- cluster
 
 resource "aws_rds_cluster" "this" {
+  # CKV_AWS_139 — la protection contre la suppression EST activée, mais via une
+  # expression conditionnelle sur l'environnement que l'analyse statique ne résout
+  # pas. En production, `var.environment` vaut "prod" et la protection est active ;
+  # s'en priver en dev obligerait à la lever manuellement à chaque destruction d'un
+  # environnement éphémère.
+  #checkov:skip=CKV_AWS_139: activée en production via var.environment, non résoluble statiquement
+
+  # CKV2_AWS_27 — le contrôle demande de journaliser TOUTES les requêtes SQL. On ne
+  # le fait pas, et c'est délibéré : cette base ne contient aucune donnée de carte
+  # (le PAN vit dans le vault du PSP, on ne stocke qu'un token), donc l'exigence
+  # PCI de traçage des accès aux données de titulaires ne s'y applique pas. En
+  # revanche, un log exhaustif des requêtes ferait entrer les paramètres applicatifs
+  # dans les logs et multiplierait leur volume. On journalise les connexions et les
+  # requêtes lentes, et l'audit des accès passe par CloudTrail.
+  #checkov:skip=CKV2_AWS_27: aucune donnee carte en base ; connexions et requetes lentes journalisees
+
+  # CKV2_AWS_8 — un plan AWS Backup distinct ferait doublon : Aurora conserve 35
+  # jours de sauvegardes automatiques chiffrées avec restauration à un instant
+  # donné (PITR), plus un snapshot final à la destruction.
+  #checkov:skip=CKV2_AWS_8: sauvegardes automatiques Aurora 35 jours + PITR + snapshot final
+
   cluster_identifier = "${local.name_prefix}-payments"
 
   engine         = "aurora-postgresql"
@@ -204,7 +323,7 @@ resource "aws_rds_cluster_instance" "writer" {
   performance_insights_retention_period = var.environment == "prod" ? 465 : 7
 
   monitoring_interval = 30
-  monitoring_role_arn = var.monitoring_role_arn
+  monitoring_role_arn = aws_iam_role.monitoring.arn
 
   # Les mises a jour mineures s'appliquent pendant la fenetre de maintenance :
   # PCI DSS req. 6 impose d'appliquer les correctifs de securite.
@@ -234,6 +353,9 @@ resource "aws_rds_cluster_instance" "reader" {
 
   performance_insights_enabled    = true
   performance_insights_kms_key_id = aws_kms_key.database.arn
+
+  monitoring_interval = 30
+  monitoring_role_arn = aws_iam_role.monitoring.arn
 
   publicly_accessible        = false
   auto_minor_version_upgrade = true
