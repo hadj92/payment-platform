@@ -1,0 +1,106 @@
+# =============================================================================
+# Pré-revue assistée par IA
+#
+# Déclencheur : `pull_request`, et non `pull_request_target`.
+#
+# La différence n'est pas un détail. `pull_request_target` s'exécute dans le
+# contexte de la branche de base AVEC accès aux secrets, ce qui permet de
+# commenter les PR venues d'un fork — mais expose la clé d'API à tout code
+# qu'un contributeur extérieur ferait exécuter. Sur un dépôt qui touche au
+# paiement, l'arbitrage est vite fait : les PR de fork n'ont pas de revue
+# assistée, et c'est le comportement voulu.
+#
+# Le job ne bloque jamais la fusion. Une pré-revue qui fait échouer la CI sur un
+# faux positif apprend très vite aux équipes à la contourner — et une protection
+# contournée ne protège plus rien.
+# =============================================================================
+
+name: Pré-revue assistée
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: Relecture des règles du domaine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Les deux extrémités du diff sont nécessaires pour le calculer.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Les gardes de confidentialité passent AVANT la revue, et le job échoue
+      # si l'une d'elles cède. Un contrôle de sécurité qu'on ne teste pas est
+      # une intention, pas un contrôle : si une exclusion se casse, rien ne doit
+      # partir vers un service tiers.
+      - name: Vérifier les gardes de confidentialité
+        run: python .github/scripts/ai_review.py --self-test
+
+      - name: Installer le SDK
+        run: pip install --quiet anthropic
+
+      - name: Relire la pull request
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            # Cas normal sur une PR de fork, où les secrets ne sont pas exposés.
+            printf '## Pré-revue assistée\n\nNon exécutée : aucune clé d'"'"'API configurée pour ce contexte (PR de fork, ou secret absent).\n\nLa revue humaine reste la seule obligatoire.\n' > revue.md
+          else
+            python .github/scripts/ai_review.py \
+              --base "origin/${{ github.base_ref }}" \
+              --head "${{ github.event.pull_request.head.sha }}" \
+              --sortie revue.md
+          fi
+
+      # Un commentaire mis à jour, pas empilé : sur une PR qui reçoit dix
+      # pushes, dix commentaires de robot noient la discussion humaine.
+      - name: Publier la revue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const corps = fs.readFileSync('revue.md', 'utf8');
+            const marqueur = '## Pré-revue assistée';
+
+            const existants = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const precedent = existants.data.find(
+              c => c.user.type === 'Bot' && c.body.startsWith(marqueur)
+            );
+
+            if (precedent) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: precedent.id,
+                body: corps,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: corps,
+              });
+            }

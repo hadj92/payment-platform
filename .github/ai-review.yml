@@ -1,0 +1,153 @@
+# =============================================================================
+# Politique de la revue assistée par IA
+#
+# Ce fichier existe avant le script, et c'est délibéré : sur une plateforme de
+# paiement, la question n'est pas « est-ce que l'IA peut relire du code » — elle
+# le peut — mais « quel code a le droit de sortir de notre périmètre, et qui
+# reste responsable de la décision ».
+#
+# Trois principes, qui se lisent dans l'ordre :
+#
+#   1. CE QUI NE SORT PAS. Le diff est envoyé à un service tiers. Tout ce qui
+#      touche aux secrets, aux fixtures de données ou aux dépendances verrouillées
+#      reste ici — la valeur d'une relecture automatique n'y est de toute façon
+#      pas.
+#
+#   2. CE QUE LE RELECTEUR CHERCHE. Un linter générique trouve des variables
+#      inutilisées. Ce qui coûte de l'argent sur un service de paiement, ce sont
+#      des fautes de domaine : une capture non idempotente, un montant en
+#      flottant, un PAN qui part dans un log. Les règles ci-dessous sont celles
+#      du projet, pas des bonnes pratiques génériques.
+#
+#   3. QUI DÉCIDE. La revue IA est une PRÉ-revue, non bloquante. PCI DSS req.
+#      6.2.3 impose une revue de code par quelqu'un d'autre que l'auteur : un
+#      modèle n'est pas quelqu'un. Il débroussaille pour que le relecteur humain
+#      passe son temps sur la logique métier, pas sur le trivial.
+# =============================================================================
+
+version: 1
+
+confidentialite:
+  # Chemins dont le contenu n'est JAMAIS transmis au modèle. Le script liste le
+  # fichier comme ignoré dans son rapport, pour que l'omission soit visible
+  # plutôt que silencieuse.
+  chemins_exclus:
+    - "**/*.tfvars"
+    - "**/*.pem"
+    - "**/*.key"
+    - "**/.env*"
+    - "**/secrets/**"
+    - "**/*.lock"
+    - "**/package-lock.json"
+    - "**/.terraform.lock.hcl"
+    # Jeux de données de test : aucun intérêt en relecture, et c'est exactement
+    # le genre de fichier où un numéro réel finit par se glisser.
+    - "**/fixtures/**"
+    - "**/testdata/**"
+
+  # Garde-fou de dernier recours, appliqué au diff juste avant l'envoi. Si l'un
+  # de ces motifs apparaît, le fichier est retiré et la revue le signale.
+  # Une politique de chemins protège de ce qu'on a prévu ; ces motifs protègent
+  # du fichier que personne n'avait anticipé.
+  motifs_interdits:
+    - nom: "numero de carte (Luhn)"
+      regex: '\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b'
+    - nom: "cle AWS"
+      regex: '\bAKIA[0-9A-Z]{16}\b'
+    - nom: "cle privee"
+      regex: '-----BEGIN [A-Z ]*PRIVATE KEY'
+    - nom: "jeton GitHub"
+      regex: '\bgh[pousr]_[A-Za-z0-9]{20,}\b'
+
+budget:
+  # Au-delà, on n'envoie pas : une PR de 2000 lignes ne se relit pas utilement
+  # d'un bloc, ni par un modèle ni par un humain. Le message invite à découper.
+  max_lignes_diff: 1500
+  max_fichiers: 40
+  # Coût indicatif affiché dans le rapport, pour que la dépense soit visible de
+  # ceux qui la déclenchent.
+  afficher_cout: true
+
+revue:
+  # Non bloquant par construction. Un relecteur automatique qui fait échouer la
+  # CI sur un faux positif apprend très vite aux équipes à le contourner.
+  bloquant: false
+
+  # Les règles du domaine. Elles viennent des décisions du projet : chacune
+  # correspond à une faute qui a un coût réel en production.
+  regles:
+    - id: idempotence
+      poids: critique
+      enonce: >-
+        Toute opération mutante sur un paiement doit être idempotente. Signaler
+        un nouvel endpoint mutant sans clé d'idempotence, un SELECT suivi d'un
+        INSERT là où une contrainte d'unicité devrait arbitrer, ou un retry qui
+        régénère sa clé au lieu de la réutiliser.
+
+    - id: montants
+      poids: critique
+      enonce: >-
+        Les montants sont des entiers en unités mineures. Signaler tout float,
+        double, ou arithmétique monétaire sans Math.addExact. Signaler aussi une
+        division de montant sans règle d'arrondi explicite.
+
+    - id: donnees-carte
+      poids: critique
+      enonce: >-
+        Aucune donnée de carte ne doit être journalisée, sérialisée ou persistée.
+        Signaler un log qui prend un objet porteur de moyen de paiement, un
+        toString() par défaut sur une telle classe, un champ carte ajouté à un
+        événement ou à un DTO de réponse, ou toute colonne qui pourrait accueillir
+        un PAN.
+
+    - id: transaction-reseau
+      poids: critique
+      enonce: >-
+        Aucun appel réseau à l'intérieur d'une transaction base ouverte. Signaler
+        un appel au PSP depuis une méthode @Transactional, directement ou via une
+        méthode appelée depuis elle.
+
+    - id: machine-etats
+      poids: majeur
+      enonce: >-
+        Les transitions d'état d'un paiement passent par la machine à états.
+        Signaler une affectation directe de statut qui contourne
+        canTransitionTo, ou une transition ajoutée sans test correspondant.
+
+    - id: auto-invocation
+      poids: majeur
+      enonce: >-
+        Signaler un appel à une méthode @Transactional depuis une autre méthode
+        du même bean : le proxy Spring n'est pas traversé et l'annotation est
+        silencieusement ignorée.
+
+    - id: resilience
+      poids: majeur
+      enonce: >-
+        Les appels sortants portent timeout, retry et circuit breaker. Signaler
+        un nouvel appel sortant sans ces garde-fous, un retry sans jitter, ou un
+        retry déclenché sur un refus émetteur plutôt que sur une erreur technique.
+
+    - id: multi-tenant
+      poids: majeur
+      enonce: >-
+        Le cloisonnement par hôtel ne se fait jamais sur un paramètre fourni par
+        le client. Signaler une requête filtrée sur un hotelId issu du corps ou
+        de la query string plutôt que du jeton d'authentification.
+
+    - id: migrations
+      poids: majeur
+      enonce: >-
+        Les migrations doivent pouvoir s'appliquer sur une table active. Signaler
+        un ALTER bloquant, un index créé sans CONCURRENTLY, un NOT NULL ajouté
+        sans valeur par défaut, ou une migration modifiée après coup.
+
+  # Ce que le relecteur doit explicitement NE PAS remonter. Sans cette liste, il
+  # produit du bruit de style qui noie les trois signalements qui comptaient, et
+  # plus personne ne lit ses commentaires au bout de deux semaines.
+  hors_perimetre:
+    - "mise en forme, indentation, longueur de ligne : le formateur s'en charge"
+    - "préférences de nommage sans conséquence fonctionnelle"
+    - "suggestions de refactoring non liées au diff"
+    - "absence de commentaires sur du code lisible"
+    - "ce que les tests, Checkov, CodeQL ou Trivy détectent déjà"

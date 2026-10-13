@@ -204,6 +204,50 @@ cd infra/envs/prod && terraform init -backend=false && terraform validate
 - Scans : CodeQL (SAST), Trivy (dépendances + image), gitleaks (secrets dans l'historique), Checkov (policy as code sur le Terraform).
 - **Image taguée par SHA, jamais `latest`** — un déploiement doit être reproductible et un rollback doit viser une image précise.
 
+### Pré-revue assistée par IA
+
+Une troisième chaîne relit chaque pull request (`.github/workflows/ai-review.yml`). Elle ne cherche pas des défauts de style — un formateur, CodeQL, Checkov et Trivy tournent déjà — mais les **fautes de domaine que l'analyse statique ne voit pas** : une capture non idempotente, un montant en flottant, un appel au PSP dans une transaction ouverte, un objet carte qui part dans un log.
+
+Les règles vivent dans [`.github/ai-review.yml`](.github/ai-review.yml), pas dans le prompt : elles se relisent, se discutent en PR et évoluent avec le projet.
+
+**Trois décisions structurent cette chaîne, et elles priment sur la technique :**
+
+1. **Ce qui ne sort pas du périmètre.** Le diff part chez un tiers, donc une politique de chemins exclut les `.tfvars`, les clés, les fixtures ; et un garde-fou de motifs (PAN valide au sens de Luhn, clés AWS, clés privées) retire tout fichier qui en contient. Les deux ne font pas le même travail : les chemins protègent de ce qu'on a prévu, les motifs du fichier que personne n'avait anticipé. Les fichiers retirés sont **listés dans le rapport** — une protection silencieuse ne se vérifie pas.
+
+2. **Qui décide.** La revue est **non bloquante**. PCI DSS req. 6.2.3 impose qu'un code touchant au périmètre carte soit relu par une personne *autre que son auteur* : un modèle n'est pas une personne, il n'engage pas sa responsabilité et ne répond pas devant un auditeur. Cette étape débroussaille pour que le relecteur humain passe son temps sur la logique métier.
+
+3. **Le déclencheur est `pull_request`, pas `pull_request_target`.** Le second permettrait de commenter les PR venues d'un fork, mais exposerait la clé d'API à du code extérieur. Sur un dépôt qui touche au paiement, les PR de fork n'ont pas de revue assistée — et c'est voulu.
+
+Trois garde-fous d'exploitation complètent l'ensemble : les gardes de confidentialité sont **auto-testées avant chaque revue** (si une exclusion cède, rien ne part) ; au-delà de 1500 lignes la revue ne se lance pas et invite à découper ; et le coût de chaque relecture est affiché dans le rapport, parce qu'une dépense invisible n'est arbitrée par personne.
+
+```bash
+python .github/scripts/ai_review.py --self-test     # vérifie les gardes, sans réseau
+```
+
+<details><summary>À quoi ressemble un rapport</summary>
+
+```markdown
+## Pré-revue assistée
+
+### 🔴 critique — `RemboursementService.java` ligne ~11
+
+**Règle `transaction-reseau`** — Appel au PSP dans une méthode @Transactional.
+
+> **Ce qui casse :** Sous charge, chaque remboursement immobilise une connexion
+> du pool pendant l'appel réseau ; le pool se vide et tout le service s'arrête,
+> lectures comprises.
+
+**Piste :** Fermer la transaction avant l'appel, en ouvrir une seconde pour le résultat.
+
+---
+<sub>16 lignes relues · 4800 tokens, ~0.038 $ · modèle `claude-opus-5`</sub>
+<sub>**Cette revue ne remplace pas une relecture humaine.**</sub>
+```
+
+Chaque signalement doit porter **le scénario concret dans lequel ça casse**. C'est une contrainte du prompt, et elle sert de filtre : un défaut dont on ne sait pas dire ce qu'il casse n'en est pas un, et ne mérite pas d'interrompre un relecteur.
+
+</details>
+
 > **Les étapes de déploiement sont écrites mais désactivées.** Build d'image, `terraform plan`/`apply` et détection de dérive ne s'exécutent que si le dépôt est relié à un compte AWS — variable de dépôt `DEPLOY_ENABLED=true` et secrets de rôle OIDC. Sans cible configurée, ces jobs échoueraient systématiquement, et un badge rouge permanent finit par ne plus rien signaler. Le code du pipeline reste complet et lisible : c'est lui qui documente la chaîne de livraison.
 
 ---
