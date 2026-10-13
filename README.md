@@ -144,7 +144,9 @@ Chaque exception porte **sa justification dans le code**, à côté de la ressou
 
 - la politique d'une **clé KMS** utilise `resources = ["*"]`, où `*` désigne la clé elle-même : c'est la seule écriture possible, et les contrôles IAM génériques ne s'y appliquent pas ;
 - le trafic **ALB → tâche** est en HTTP : c'est une limite assumée et documentée, pas un oubli — le chiffrement de bout en bout demanderait de distribuer un certificat à chaque tâche ;
-- `CVE-2026-47884` (spring-webmvc) est écartée après **analyse d'exploitabilité** : l'application n'utilise aucune vue XSLT, n'expose que du JSON et ne déclare aucun `ViewResolver`. Le correctif n'existe qu'en Spring Framework 7, donc Spring Boot 4 — migration planifiée séparément.
+- deux CVE `spring-webmvc` sont écartées après **analyse d'exploitabilité** vérifiée dans les sources : l'une vise les vues XSLT, l'autre les Server-Sent Events combinés à une résolution de vue. L'application n'utilise ni l'un ni l'autre — zéro occurrence de `SseEmitter`, `ViewResolver` ou `ModelAndView`, et ses deux seuls points d'entrée web sérialisent du JSON.
+
+> **Et le signal que ça donne.** Ces deux CVE sont apparues à une semaine d'intervalle et sont toutes deux corrigées en Spring Framework 7, donc Spring Boot 4. Ce n'est plus une exception ponctuelle, c'est une tendance : la branche 3.5 va continuer d'en accumuler. Le fichier `.trivyignore` porte donc une **règle d'arrêt décidée à l'avance** — à la troisième entrée de cette famille, on arrête d'exclure et on migre. Sans seuil fixé avant d'en avoir besoin, une liste d'exclusions ne fait que grandir.
 
 ### Scénarios simulables par préfixe de token
 
